@@ -1,0 +1,84 @@
+# AI Gateway Runtime — example configuration
+server:
+  addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 120s
+  read_header_timeout: 10s  # slowloris guard; streaming tail is exempt
+  # tls_crt: /path/to/cert
+  # tls_key: /path/to/key
+
+access:
+  api_keys:
+    - sk-gateway-demo
+  rate_limit_per_second: 50
+  rate_limit_burst: 100
+
+latency:
+  strict: 500ms
+  normal: 2s
+  loose: 5s
+
+scheduler:
+  virtual_nodes: 160
+  health_probe_every: 3s
+  metrics_scrape_every: 5s
+  min_stable_window: 2s
+  # Load-aware scheduling: among this many prefix-affinity neighbors, pick the
+  # one with the best live GPU/cache/wait signal. 1 = pure prefix affinity
+  # (maximize KV-cache hit at the cost of ignoring load). The gateway also
+  # feeds cached_tokens/prompt_tokens back per request, so a persistently-low
+  # hit rate discounts an affinity target over time.
+  load_aware_candidates: 3
+  # Deprioritize a candidate whose num_requests_waiting is at/above this value.
+  waiting_requests_threshold: 8
+
+policy:
+  default_latency_class: normal
+  routes:
+    "gpt-4o-mini": group-a
+    "qwen2.5-72b": group-a
+  acl:
+    "sk-gateway-demo": []
+
+# Context Pipeline: the engine + Plugin contract are active, but no built-in
+# plugins ship with the gateway. Real plugins (Memory/RAG/Rewrite/Summary) are
+# implemented by the upper layer per the produces/consumes contract and
+# registered in buildContextPlugins; until then the engine is a no-op. Plugin
+# enable/timeout flags are owned by the upper-layer wiring, not modeled here.
+context:
+  enabled: true
+
+pii:
+  enabled: true
+  map_ttl: 5m
+  buffer_cap: 65536
+  patterns:
+    - name: email
+      pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    - name: phone
+      pattern: '\b1[3-9]\d{9}\b'
+
+eventbus:
+  enabled: true
+  workers: 2
+  buffer_cap: 1024
+
+# Outbound HTTP transport to backends. Defaults favor streaming latency
+# stability: a warm per-host idle pool so re-handshakes are rare, a soft
+# MaxConnsPerHost for backpressure, and HTTP/2 when the backend supports it.
+connector:
+  max_idle_conns: 1024
+  max_idle_conns_per_host: 128
+  max_conns_per_host: 512
+  idle_conn_timeout: 90s
+  force_attempt_http2: true
+
+instances:
+  - id: vllm-0
+    base_url: http://127.0.0.1:8000
+    model: qwen2.5-72b
+    weight: 1
+  - id: vllm-1
+    base_url: http://127.0.0.1:8001
+    model: qwen2.5-72b
+    weight: 1
