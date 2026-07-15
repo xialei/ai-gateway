@@ -213,3 +213,62 @@ func itoa(i int) string {
 // keep import referenced.
 var _ = ewma.New
 var _ sync.Mutex
+
+// TestEngineWritesBackRemainingBudget is the regression for the budget-not-
+// written-back bug: Run used to decrement a local `remaining` as plugins
+// consumed time but never assign it back to req.Budget, so the connector raced
+// backend headers against the ORIGINAL full budget (context plugins + backend
+// headers could sum to ~2x the configured latency class). After Run,
+// req.Budget must reflect the time the context pipeline actually consumed.
+func TestEngineWritesBackRemainingBudget(t *testing.T) {
+	p := &recordingPlugin{name: "slow", produces: []string{"slow_out"}, delay: 100 * time.Millisecond}
+	e, err := NewEngine([]Plugin{p}, NewBreakers(NewMemoryBreakerStore(0.5, 10*time.Second)), slog.Default())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	req := newReq(500 * time.Millisecond)
+	_, _ = e.Run(context.Background(), req)
+	// The plugin spent ~100ms; the remaining budget written back must be
+	// strictly less than the original 500ms.
+	if req.Budget >= 500*time.Millisecond {
+		t.Errorf("req.Budget not decremented: got %v (plugin should have consumed ~100ms)", req.Budget)
+	}
+	if req.Budget < 350*time.Millisecond || req.Budget > 500*time.Millisecond {
+		// sanity band: should be roughly 400ms ± timing slop
+		t.Logf("note: req.Budget=%v", req.Budget)
+	}
+}
+
+// TestEnginePluginPanicFailsOpen is the regression for the no-recover crash: a
+// panicking plugin used to propagate and kill the gateway process, violating
+// the documented fail-open contract. The engine must recover the panic, mark
+// the plugin failed, and return (last-good/empty) artifacts without crashing.
+func TestEnginePluginPanicFailsOpen(t *testing.T) {
+	panicker := &panicPlugin{name: "boom", produces: []string{"boom_out"}}
+	e, err := NewEngine([]Plugin{panicker}, NewBreakers(NewMemoryBreakerStore(0.5, 10*time.Second)), slog.Default())
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	req := newReq(500 * time.Millisecond)
+	// Must not panic (which would fail the test process).
+	out, runErr := e.Run(context.Background(), req)
+	if runErr != nil {
+		t.Fatalf("Run returned error: %v", runErr)
+	}
+	if _, ok := out["boom_out"]; ok {
+		t.Error("panicking plugin should not have produced artifacts")
+	}
+}
+
+type panicPlugin struct {
+	name     string
+	produces []string
+	consumes []string
+}
+
+func (p *panicPlugin) Name() string       { return p.name }
+func (p *panicPlugin) Produces() []string { return p.produces }
+func (p *panicPlugin) Consumes() []string { return p.consumes }
+func (p *panicPlugin) Execute(ctx context.Context, req *model.Request, art Artifacts, deadline time.Time, remaining time.Duration) (Artifacts, error) {
+	panic("simulated plugin bug")
+}

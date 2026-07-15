@@ -162,6 +162,20 @@ func (e *Engine) Run(ctx context.Context, req *model.Request) (Artifacts, error)
 			wg.Add(1)
 			go func(p Plugin, art Artifacts, rem time.Duration, dl time.Time) {
 				defer wg.Done()
+				// Fail-open extends to panics: a buggy upper-layer plugin must
+				// never crash the gateway. Recover, mark the plugin done (no
+				// artifacts), and record a breaker failure so repeated panics
+				// trip the breaker.
+				defer func() {
+					if r := recover(); r != nil {
+						e.logger.Error("plugin panicked, using fallback",
+							"plugin", p.Name(), "panic", r)
+						mu.Lock()
+						completed[p.Name()] = true
+						e.breakers.Record(p.Name(), 0, false)
+						mu.Unlock()
+					}
+				}()
 				out, spent, ok := e.runPlugin(ctx, p, req, art, dl, rem)
 				mu.Lock()
 				defer mu.Unlock()
@@ -186,6 +200,12 @@ func (e *Engine) Run(ctx context.Context, req *model.Request) (Artifacts, error)
 		}
 		wg.Wait()
 	}
+	// Write the budget the context pipeline actually consumed back to the
+	// request, so the connector's doWithHeaderBudget races backend headers
+	// against what's left — not the original full budget. Without this,
+	// context plugins + backend headers can sum to ~2x the configured latency
+	// class.
+	req.Budget = remaining
 	return artifacts, nil
 }
 

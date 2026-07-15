@@ -30,6 +30,11 @@ scheduler:
   # Deprioritize a candidate whose num_requests_waiting is at/above this value
   # (its KV cache is under eviction pressure). 0 disables.
   waiting_requests_threshold: 8
+  # Start the in-process mock backend (demo/local-dev only). With no instances
+  # configured this exercises the full pipeline end-to-end without external
+  # services. Never enable in production — an empty instances list otherwise
+  # means "no backends" (requests 503 until discovery populates).
+  mock: true
 
 policy:
   default_latency_class: normal

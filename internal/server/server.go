@@ -3,6 +3,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,22 +39,30 @@ type Server struct {
 	registry   *scheduler.Registry
 	scheduler  *scheduler.Scheduler
 	http       *http.Server
+	mockCloser io.Closer
 }
 
 // New constructs a Server from config. Modules are injected here as the
 // pipeline is built out in later stages.
 func New(cfg *config.Config, logger *slog.Logger) *Server {
 	accessGate := access.New(cfg.Access)
-	// The connector's header timeout bounds connect + first-byte only; the
-	// streaming tail is exempt. Use the strict budget as the ceiling so a
-	// strict-class request never waits too long for a backend to respond.
-	conn := connector.New(cfg.Latency.Normal, cfg.Connector)
+	// No transport-level ResponseHeaderTimeout: a single global value would cap
+	// every latency class at the same ceiling (e.g. a loose 5s request killed at
+	// the normal 2s budget). Instead the per-request budget in
+	// connector.doWithHeaderBudget governs connect + first-byte per class, with
+	// the streaming tail exempt.
+	conn := connector.New(cfg.Connector)
 
-	// Membership source: static config, optionally seeded with an in-process
-	// mock backend when no real instances are configured.
+	// Membership source: static config. The in-process mock backend is opt-in
+	// (cfg.Scheduler.Mock) for demos / local development — never inferred from
+	// the absence of instances, since a production deploy can legitimately start
+	// with zero instances while service discovery populates.
 	var source scheduler.InstanceSource = scheduler.NewStaticSource(cfg.Instances)
-	if len(cfg.Instances) == 0 {
-		source = newMockSource(logger)
+	var mockCloser io.Closer
+	if cfg.Scheduler.Mock {
+		mockSrc := newMockSource(logger)
+		source = mockSrc
+		mockCloser = mockSrc
 	}
 	registry := scheduler.NewRegistry(source, cfg.Scheduler, logger)
 	sched := scheduler.New(registry, cfg.Scheduler)
@@ -110,6 +119,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		connector:  conn,
 		registry:   registry,
 		scheduler:  sched,
+		mockCloser: mockCloser,
 	}
 
 	mux := http.NewServeMux()
@@ -274,7 +284,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// RedactMessages shares entity→id across the whole request, so the same
 	// entity in multiple messages maps to one placeholder and one store entry.
 	var piiIDs []string
-	if req.PIIDecision == model.PIIRedact && s.redactor != nil {
+	if req.PIIDecision == model.PIIRedact {
+		// Fail closed: an external target the Policy Engine marked as needing
+		// redaction must never be forwarded with PII intact. If the redactor is
+		// nil (PII disabled in config, or pattern compilation failed at startup)
+		// the safe action is to refuse the request, not to leak it.
+		if s.redactor == nil {
+			writeError(w, http.StatusServiceUnavailable, "pii redaction required but unavailable")
+			return
+		}
 		piiIDs = s.redactor.RedactMessages(req.Messages)
 	}
 	// Release id→entity mappings when the request completes.
@@ -428,6 +446,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.bus != nil {
 			s.bus.Drain()
 		}
+		_ = s.closeMock()
 		return err
 	case err := <-errCh:
 		s.registry.Stop()
@@ -435,14 +454,29 @@ func (s *Server) Run(ctx context.Context) error {
 			s.bus.Stop()
 			s.bus.Drain()
 		}
+		_ = s.closeMock()
 		return err
 	}
+}
+
+// closeMock stops the in-process mock backend's listener if one was started,
+// reaping its serve goroutine and file descriptor. No-op (returns nil) when no
+// mock is in use.
+func (s *Server) closeMock() error {
+	if s.mockCloser != nil {
+		return s.mockCloser.Close()
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(`{"error":"` + msg + `"}`))
+	// Marshal via encoding/json so quotes / backslashes / control chars in msg
+	// (which originate from err.Error(), including raw backend response bodies)
+	// are escaped. Naive string concatenation would emit malformed JSON and let
+	// a backend inject arbitrary fields.
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // streamWriter wraps an http.ResponseWriter + Flusher as an io.Writer for

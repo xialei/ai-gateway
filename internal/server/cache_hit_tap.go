@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// maxTapLine bounds the held partial line. A single SSE data line should never
+// approach this (usage chunks are tiny); if a backend streams bytes without a
+// newline for this long, the tap gives up parsing rather than growing without
+// bound. The relay itself is unaffected — bytes still flow to the client.
+const maxTapLine = 1 << 20 // 1 MiB
+
 // cacheHitTap is a zero-stall pass-through io.Reader that inspects the SSE
 // stream relayed to the client to recover the backend's final usage chunk,
 // from which it extracts the KV-cache hit fraction (cached_tokens /
@@ -16,7 +22,7 @@ import (
 // It MUST NOT delay the stream: bytes are forwarded to the caller as soon as
 // they arrive. Parsing is done on the same bytes after they have been handed
 // off; the only state held is a line buffer for the SSE frame currently being
-// assembled (bounded by the chunk sizes the backend already emits).
+// assembled (bounded by maxTapLine).
 //
 // The tap tolerates non-SSE or malformed bodies: if no usage chunk is seen,
 // or the body is not OpenAI-shaped SSE, onHit is simply never called.
@@ -27,7 +33,7 @@ type cacheHitTap struct {
 	// line accumulates the current SSE data line across Read calls. A data
 	// line is emitted when a newline is seen; a frame is complete on a blank
 	// line. Only the final usage frame matters, so partial frames are held
-	// until completed.
+	// until completed (bounded by maxTapLine).
 	line []byte
 	// sawDone after the OpenAI [DONE] sentinel: no further parsing needed.
 	done bool
@@ -61,8 +67,17 @@ func (t *cacheHitTap) parse(b []byte) {
 	for i := 0; i < len(b); {
 		nl := indexByte(b[i:], '\n')
 		if nl < 0 {
-			// No newline in the remainder: hold it for the next Read.
+			// No newline in the remainder: hold it for the next Read. Cap the
+			// held line so a malformed/adversarial backend streaming bytes
+			// without a newline cannot grow it without bound (OOM). On cap
+			// overflow the tap gives up parsing this stream (best-effort); the
+			// relay itself is unaffected.
 			t.line = append(t.line, b[i:]...)
+			if len(t.line) > maxTapLine {
+				t.line = t.line[:0]
+				t.done = true
+				return
+			}
 			return
 		}
 		line := b[i : i+nl]

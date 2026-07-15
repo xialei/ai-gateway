@@ -90,3 +90,29 @@ func TestCacheHitTapHandlesZeroCached(t *testing.T) {
 		t.Errorf("expected 0 hit fraction on full miss, got %v", got)
 	}
 }
+
+// TestCacheHitTapCapsRunawayLine is the regression for the unbounded-line
+// OOM: a backend that streams bytes without a newline used to grow t.line
+// without bound. The tap must cap the held line and give up parsing (the relay
+// itself is unaffected — every byte still reaches the caller).
+func TestCacheHitTapCapsRunawayLine(t *testing.T) {
+	// 2 MiB with no newline — well past maxTapLine (1 MiB).
+	blob := strings.Repeat("a", 2*1024*1024)
+	var saw int64
+	tap := newCacheHitTap(strings.NewReader(blob), func(frac float64) { saw++ })
+
+	n, err := io.Copy(io.Discard, tap)
+	if err != nil {
+		t.Fatalf("relay failed: %v", err)
+	}
+	if n != int64(len(blob)) {
+		t.Errorf("relay dropped bytes: copied %d want %d", n, len(blob))
+	}
+	if saw != 0 {
+		t.Errorf("tap should not have reported a hit on a newline-less blob")
+	}
+	if !tap.done {
+		t.Error("tap should have stopped parsing after the line cap")
+	}
+}
+

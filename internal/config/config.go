@@ -109,6 +109,12 @@ type SchedulerConfig struct {
 	BreakerErrorThreshold float64 `yaml:"breaker_error_threshold"`
 	// BreakerOpenFor is how long a tripped breaker stays open before half-open.
 	BreakerOpenFor time.Duration `yaml:"breaker_open_for"`
+	// Mock starts an in-process mock backend when true. Intended for demos /
+	// local development only; never enable in production. When false (the
+	// default) and Instances is empty, the gateway starts with no backends and
+	// requests 503 until an InstanceSource adapter populates membership —
+	// rather than silently serving mock responses to real traffic.
+	Mock bool `yaml:"mock"`
 }
 
 type PolicyConfig struct {
@@ -173,6 +179,15 @@ func Load(path string) (*Config, error) {
 func (c *Config) applyDefaults() {
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
+	}
+	// Rate-limit defaults: an unset rate must not deadlock traffic. A zero rate
+	// in the limiter is treated as "unlimited" (see access.newRateLimiter), but
+	// give explicit sane defaults too so the configured values are observable.
+	if c.Access.RateLimitPerSecond <= 0 {
+		c.Access.RateLimitPerSecond = 100
+	}
+	if c.Access.RateLimitBurst <= 0 {
+		c.Access.RateLimitBurst = 200
 	}
 	if c.Latency.Strict == 0 {
 		c.Latency.Strict = 500 * time.Millisecond

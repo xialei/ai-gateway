@@ -138,9 +138,17 @@ type rateLimiter struct {
 	burst      float64
 	tokens     float64
 	lastUpdate time.Time
+	// unlimited is set when rate <= 0: a zero rate would add elapsed*0 tokens
+	// on each call (never refilling), so the bucket would allow exactly one
+	// request then block all subsequent traffic. Treating rate<=0 as unlimited
+	// avoids bricking the gateway when rate limiting is left unconfigured.
+	unlimited bool
 }
 
 func newRateLimiter(rate float64, burst int) *rateLimiter {
+	if rate <= 0 {
+		return &rateLimiter{unlimited: true}
+	}
 	if burst <= 0 {
 		burst = 1
 	}
@@ -153,6 +161,9 @@ func newRateLimiter(rate float64, burst int) *rateLimiter {
 }
 
 func (rl *rateLimiter) allow() bool {
+	if rl.unlimited {
+		return true
+	}
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()

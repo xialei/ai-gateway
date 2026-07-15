@@ -16,7 +16,7 @@ import (
 
 func newTestConnector(t *testing.T) *Connector {
 	t.Helper()
-	return New(30*time.Second, config.ConnectorConfig{})
+	return New(config.ConnectorConfig{})
 }
 
 // TestHeaderBudgetTimesOut proves the per-request budget actually binds

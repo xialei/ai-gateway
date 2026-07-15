@@ -201,14 +201,16 @@ func (rs *Restorer) processBuffer(flushTail bool) string {
 		// find the closing sentinel
 		endIdx := strings.Index(rest[len(sentinelStart):], sentinelEnd)
 		if endIdx < 0 {
-			// incomplete sentinel: hold it all unless flushTail
+			// incomplete sentinel: hold it all unless flushTail.
 			if flushTail {
-				// stream ended mid-sentinel → degrade to [REDACTED] (we can't
-				// resolve the id; emit the literal start as [REDACTED] is safer,
-				// but the spec says pass through [REDACTED] for unresolved ids).
+				// Stream ended mid-sentinel → the id cannot be resolved, so
+				// degrade the sentinel-start prefix to [REDACTED]. Then continue
+				// scanning the remainder (mirrors scanNoBuffer) so trailing
+				// content after the partial sentinel is preserved, not dropped.
 				out.WriteString("[REDACTED]")
 				rs.redacted++
-				return out.String()
+				s = rest[len(sentinelStart):]
+				continue
 			}
 			rs.buf.WriteString(rest)
 			return out.String()

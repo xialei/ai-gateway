@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/lei.xia/ai-gateway/internal/config"
@@ -23,27 +22,20 @@ import (
 // Connector owns the HTTP client used to reach backends.
 type Connector struct {
 	client *http.Client
-	// bufPool reuses bytes.Buffer across encode→Forward calls so each request
-	// avoids the grow+alloc churn inside json.Marshal. The buffer is returned
-	// to the pool after the request body is fully consumed (bytes.NewReader
-	// holds a reference to the slice, so the buffer can be reset and reused
-	// only after the request is sent).
-	bufPool sync.Pool
 }
 
 // New constructs a Connector. The client is tuned for streaming:
 //   - No client-side Timeout (it would cap the entire streaming response).
-//   - ResponseHeaderTimeout bounds connect + first-byte (the budget-governed
-//     portion); the streaming tail is NOT bound by it, so long generations
-//     are not truncated. The request's own context (the caller's r.Context)
+//   - No transport-level ResponseHeaderTimeout: a single global value would cap
+//     every latency class at the same ceiling (e.g. a loose 5s request killed
+//     at the normal 2s budget). Instead the per-request budget in
+//     doWithHeaderBudget governs connect + first-byte per class, with the
+//     streaming tail exempt. The request's own context (the caller's r.Context)
 //     still cancels the stream if the client disconnects.
 //   - A generous per-host idle pool so a warm instance rarely re-handshakes,
 //     and a soft MaxConnsPerHost for backpressure — the connection-oriented
 //     resource model (a connection is the unit, not a request).
-func New(headerTimeout time.Duration, cc config.ConnectorConfig) *Connector {
-	if headerTimeout <= 0 {
-		headerTimeout = 30 * time.Second
-	}
+func New(cc config.ConnectorConfig) *Connector {
 	if cc.MaxIdleConns <= 0 {
 		cc.MaxIdleConns = 1024
 	}
@@ -54,7 +46,6 @@ func New(headerTimeout time.Duration, cc config.ConnectorConfig) *Connector {
 		cc.IdleConnTimeout = 90 * time.Second
 	}
 	return &Connector{
-		bufPool: sync.Pool{New: func() any { return new(bytes.Buffer) }},
 		client: &http.Client{
 			Timeout: 0,
 			Transport: &http.Transport{
@@ -62,10 +53,9 @@ func New(headerTimeout time.Duration, cc config.ConnectorConfig) *Connector {
 				MaxIdleConnsPerHost: cc.MaxIdleConnsPerHost,
 				// 0 means unlimited; only set when configured so the default
 				// path does not impose an unintended cap.
-				MaxConnsPerHost:       cc.MaxConnsPerHost,
-				IdleConnTimeout:       cc.IdleConnTimeout,
-				ResponseHeaderTimeout: headerTimeout,
-				ForceAttemptHTTP2:     cc.ForceAttemptHTTP2,
+				MaxConnsPerHost:    cc.MaxConnsPerHost,
+				IdleConnTimeout:    cc.IdleConnTimeout,
+				ForceAttemptHTTP2:  cc.ForceAttemptHTTP2,
 			},
 		},
 	}
@@ -84,17 +74,20 @@ func New(headerTimeout time.Duration, cc config.ConnectorConfig) *Connector {
 // class. This is the per-request budget that the transport-level
 // ResponseHeaderTimeout (a single global value) could not provide.
 func (c *Connector) Forward(ctx context.Context, baseURL string, req model.Request) (io.ReadCloser, string, *http.Header, error) {
-	buf := c.bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	if err := encode(buf, req); err != nil {
-		c.bufPool.Put(buf)
+	// A fresh buffer per request (not pooled). Pooling the request-body buffer
+	// is unsafe: on a header-budget timeout doWithHeaderBudget returns while
+	// the in-flight client.Do goroutine is still reading the request body from
+	// bytes.NewReader(payload). Returning such a buffer to a sync.Pool would
+	// let another Forward reset/overwrite it mid-read — a data race corrupting
+	// the outbound body. The GC handles a per-request buffer correctly.
+	var buf bytes.Buffer
+	if err := encode(&buf, req); err != nil {
 		return nil, "", nil, err
 	}
 	payload := buf.Bytes()
 	url := strings.TrimRight(baseURL, "/") + "/v1/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		c.bufPool.Put(buf)
 		return nil, "", nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -102,10 +95,6 @@ func (c *Connector) Forward(ctx context.Context, baseURL string, req model.Reque
 	httpReq.Header.Set("X-Request-Id", req.ID)
 
 	resp, err := c.doWithHeaderBudget(ctx, httpReq, req.Budget)
-	// The request body (payload) has been fully read by the transport once Do
-	// returns (or errored), so the pooled buffer can be returned now. The
-	// response body streams independently and is closed by the caller.
-	c.bufPool.Put(buf)
 	if err != nil {
 		return nil, "", nil, fmt.Errorf("backend call: %w", err)
 	}
@@ -136,9 +125,11 @@ var ErrHeaderTimeout = errors.New("backend header timeout exceeded budget")
 // response or the client disconnecting).
 func (c *Connector) doWithHeaderBudget(ctx context.Context, httpReq *http.Request, budget time.Duration) (*http.Response, error) {
 	if budget <= 0 {
-		// No per-request budget: fall back to the transport's global
-		// ResponseHeaderTimeout (set at construction) as the ceiling.
-		return c.client.Do(httpReq)
+		// No per-request budget: there is no transport-level ceiling either
+		// (New intentionally omits ResponseHeaderTimeout so one latency class
+		// is not capped at another's budget). Use a generous default so a
+		// misconfigured request still fails fast rather than hanging forever.
+		budget = 30 * time.Second
 	}
 	type result struct {
 		resp *http.Response

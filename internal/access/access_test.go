@@ -67,3 +67,23 @@ func TestAuthenticateRejectsUnknownKey(t *testing.T) {
 		t.Error("unknown key should be rejected")
 	}
 }
+
+// TestRateLimiterUnlimitedWhenRateZero is the regression for the rate-limiter
+// deadlock: a zero rate (config left the field unset) used to make the bucket
+// allow exactly one request then 429 every subsequent call forever, because
+// elapsed*0 adds no tokens. A zero rate must now mean "unlimited" so an
+// unconfigured limiter never bricks traffic.
+func TestRateLimiterUnlimitedWhenRateZero(t *testing.T) {
+	a := New(config.AccessConfig{APIKeys: []string{"k"}}) // rate + burst both 0
+	for i := 0; i < 1000; i++ {
+		if !a.AllowRateLimit("k") {
+			t.Fatalf("call %d denied under zero-rate (unlimited) limiter", i)
+		}
+	}
+	// Empty-key fallback path must be unlimited too.
+	for i := 0; i < 1000; i++ {
+		if !a.AllowRateLimit("") {
+			t.Fatalf("empty-key call %d denied under zero-rate limiter", i)
+		}
+	}
+}

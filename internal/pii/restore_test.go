@@ -257,6 +257,42 @@ func TestRestoreJSONEscapedSentinelSplitAcrossChunks(t *testing.T) {
 	}
 }
 
+// TestRestoreFlushTailPreservesTrailingContent is the regression for the
+// processBuffer flushTail path: when the stream ends mid-sentinel (an
+// incomplete placeholder followed by trailing content), the trailing content
+// must be preserved, not dropped. Previously the flushTail branch wrote
+// [REDACTED] and returned immediately, discarding the remainder — diverging
+// from scanNoBuffer which continues scanning.
+func TestRestoreFlushTailPreservesTrailingContent(t *testing.T) {
+	store := NewMemoryMapStore()
+	rs := NewRestorer(store, 64*1024, nil)
+	// An incomplete sentinel (start with no closing NUL) followed by content.
+	// The sentinel-start prefix degrades to [REDACTED]; the trailing content
+	// ("abc world") must survive — previously it was dropped entirely.
+	incomplete := sentinelStart + "abc world"
+	out := rs.Feed(incomplete) + rs.Flush()
+	want := "[REDACTED]abc world"
+	if out != want {
+		t.Errorf("got %q, want %q (trailing content dropped)", out, want)
+	}
+	_, redacted, _ := rs.Stats()
+	if redacted != 1 {
+		t.Errorf("expected 1 redacted, got %d", redacted)
+	}
+}
+
+// TestRestoreFlushTailIncompleteAtBufferEnd covers the case where the buffer
+// holds only the sentinel start with nothing after it at flush time.
+func TestRestoreFlushTailIncompleteAtBufferEnd(t *testing.T) {
+	store := NewMemoryMapStore()
+	rs := NewRestorer(store, 64*1024, nil)
+	out := rs.Feed("pre " + sentinelStart) + rs.Flush()
+	want := "pre [REDACTED]"
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
 func mustPatterns(t *testing.T, raw []RawPattern) []Pattern {
 	t.Helper()
 	p, err := CompilePatterns(raw)
