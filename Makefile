@@ -27,10 +27,10 @@ clean:
 
 # demo runs the gateway against the in-process mock backend (no external
 # services required) and prints a sample streaming request. Uses
-# config.demo.yaml, which has no instances configured so the gateway starts an
+# config.demo.yaml, which sets scheduler.mock: true so the gateway starts an
 # in-process mock and schedules against it.
 demo:
-	@echo ">> starting gateway on :8080 (mock backend, no instances configured)"
+	@echo ">> starting gateway on :8080 (mock backend, scheduler.mock=true)"
 	@go run ./cmd/gateway -config config.demo.yaml &
 	@sleep 1.5
 	@echo ">> streaming chat request:"

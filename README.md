@@ -18,23 +18,115 @@ vLLM / SGLang 推理集群。使用 Go 编写。
 ## 当前状态
 
 端到端数据面已实现，所有外部依赖（Redis / Kafka / ClickHouse / 服务发现）均以接口 +
-内存默认实现提供，真实适配器为后续工作。开箱即可对内置 mock 后端运行——无需任何外部
-服务。默认事件 sink 为 no-op，演示运行不产生逐请求日志。
+内存默认实现提供，真实适配器为后续工作。开箱即可对内置 mock 后端运行——`make demo`
+无需任何外部服务。默认事件 sink 为 no-op，演示运行不产生逐请求日志。
 
 ## 快速开始
 
-```bash
-make demo        # 编译 + 对内置 mock 后端运行 + 发一个示例请求
+### 1. 编译
 
-# 或手动运行
-make run CONFIG=config.example.yaml
-curl -N -H "Authorization: Bearer sk-gateway-demo" -H "Content-Type: application/json" \
-  -d '{"model":"qwen2.5-72b","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
-  http://127.0.0.1:8080/v1/chat/completions
+```bash
+make build       # 产出 bin/ai-gateway
+# 或直接 go build -o bin/ai-gateway ./cmd/gateway
 ```
 
-将 `instances:` 指向真实的 vLLM/SGLang 端点（或任何 OpenAI 兼容后端），即可跨实例按
-prefix 亲和 + 负载感知调度。
+要求 Go 1.25+。
+
+### 2. 跑起来（内置 mock，零外部依赖）
+
+```bash
+make demo        # 启动 + 自动发一个示例请求 + 退出
+```
+
+或后台手动跑：
+
+```bash
+go run ./cmd/gateway -config config.demo.yaml
+```
+
+`config.demo.yaml` 里 `scheduler.mock: true` 会拉起一个进程内 mock 后端，开箱即可
+跑通整条链路（鉴权 → 调度 → 转发 → 流式 → PII 恢复 → 事件）。**注意：mock 仅供
+demo / 本地开发，生产不要开**——`instances` 为空且 `mock: false` 时，网关以"无后端"
+启动，请求会 503 直到服务发现注入成员。
+
+### 3. 发请求
+
+网关对外是标准 OpenAI Chat Completions 协议，客户端无需改动：
+
+```bash
+curl -N -H "Authorization: Bearer sk-gateway-demo" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"demo-model","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+     http://127.0.0.1:8080/v1/chat/completions
+```
+
+- `Authorization: Bearer <key>` —— 在 `access.api_keys` 里登记的 key；留空则任意 key
+  放行（按 key 独立限流）。
+- `model` —— 必须在 `policy.routes` 里有映射，否则按"模型名即路由目标"处理。
+- `stream: true/false` —— 流式与非流式都支持。
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/healthz   # -> ok
+```
+
+### 4. 接真实后端（vLLM / SGLang / 任意 OpenAI 兼容）
+
+编辑 `config.example.yaml`，把 `instances` 指向你的端点：
+
+```yaml
+instances:
+  - id: vllm-0
+    base_url: http://10.0.0.1:8000
+    model: qwen2.5-72b
+    weight: 1
+  - id: vllm-1
+    base_url: http://10.0.0.2:8000
+    model: qwen2.5-72b
+    weight: 1
+```
+
+```bash
+make run CONFIG=config.example.yaml
+# 或 ./bin/ai-gateway -config config.example.yaml
+```
+
+多实例时自动启用 **prefix 亲和 + 负载感知调度**：相同前缀（system + 历史）的请求
+优先打到最可能已缓存 KV 的实例，并在候选中按实时负载选最优；连接失败自动 failover
+到环上下一节点。确保后端的 `/metrics`（vLLM/SGLang Prometheus 端点）可达，调度器会
+定期抓取 `num_requests_running` / `num_requests_waiting` / `gpu_cache_usage_perc`
+作为负载信号。
+
+### 5. 外部模型 + PII 脱敏
+
+发往外部模型（OpenAI / Anthropic 等）的请求可自动脱敏，避免 PII 外泄。在 `policy`
+里把目标标为 `external_targets`：
+
+```yaml
+policy:
+  routes:
+    "gpt-4o": openai-external
+  external_targets:
+    - openai-external
+pii:
+  enabled: true
+  patterns:
+    - name: email
+      pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    - name: phone
+      pattern: '\b1[3-9]\d{9}\b'
+```
+
+请求外发前，命中的 PII 会被替换为哨兵占位符并建立映射；流式回包时再用有界状态机
+还原。**安全行为**：若某目标被标为需脱敏但 PII 未启用（或规则编译失败），网关会
+**拒绝转发（503）**而非泄露原文——fail-closed。
+
+### 6. 优雅停机
+
+`SIGINT` / `SIGTERM` 触发：停止健康探测与事件总线、`http.Server.Shutdown`（5s 超时）、
+排空事件缓冲、关闭 mock 监听器（若启用）。
+
 
 ## 模块
 
@@ -84,17 +176,37 @@ prefix 亲和 + 负载感知调度。
 
 ## 配置
 
-见 [`config.example.yaml`](config.example.yaml)。关键段：
+完整示例见 [`config.example.yaml`](config.example.yaml)（接真实后端）、
+[`config.demo.yaml`](config.demo.yaml)（内置 mock）。命令行只有一个参数：
 
-- `instances` — 后端成员（静态成员；动态发现是 `scheduler.InstanceSource` 背后的适配器）
-- `latency` — 按延迟类的链路预算（`strict` / `normal` / `loose`）
-- `policy` — 模型→路由映射、ACL、`external_targets`（需 PII 脱敏的外部目标）
-- `context` — 插件 DAG 开关（内置无插件；Memory / RAG / Rewrite / Summary 由上层实现并注册到 `buildContextPlugins`，引擎默认 no-op）
-- `pii` — 检测规则、映射 TTL、恢复缓冲上限
-- `scheduler` — 虚拟节点、健康探测、指标抓取、**负载感知候选数 / 等待阈值**
-- `connector` — 出站 HTTP transport：per-host 空闲池、`MaxConnsPerHost` 反压、HTTP/2
-- `server` — `read_header_timeout`（slowloris 防护，流式 tail 豁免）
-- `eventbus` — worker 数 + 缓冲（默认 no-op sink）
+```bash
+./bin/ai-gateway -config <path-to-yaml>
+```
+
+关键段：
+
+- `instances` — 后端成员（静态；动态发现是 `scheduler.InstanceSource` 背后的适配器）。
+  为空且 `scheduler.mock: false` 时网关以"无后端"启动，请求 503 直到发现机制注入成员。
+- `scheduler.mock` — **demo / 本地开发专用**。`true` 时拉起进程内 mock 后端；生产环境
+  保持 `false`（默认）。空实例 + `mock: true` 才会服务 mock 响应，避免生产环境误配发假数据。
+- `latency` — 按延迟类的链路预算（`strict` 500ms / `normal` 2s / `loose` 5s）。预算同时
+  约束 Context Pipeline 与后端"连接 + 首字节"耗时，流式 tail 不受限。
+- `access` — `api_keys` 白名单（留空则任意 key 放行）；`rate_limit_per_second` /
+  `rate_limit_burst` 按 key 独立限流。**未设置时默认 100/s、burst 200**（不会因零值
+  把流量卡死）。
+- `policy` — 模型→路由映射、ACL（api key → 允许的模型，留空 = 全部）、`external_targets`
+  （需 PII 脱敏的外部目标）。
+- `context` — 插件 DAG 开关（内置无插件；Memory / RAG / Rewrite / Summary 由上层实现并
+  注册到 `buildContextPlugins`，引擎默认 no-op）。
+- `pii` — 检测规则、映射 TTL、恢复缓冲上限。目标被标为 `external_targets` 但 PII 未启用
+  时，请求 fail-closed（503）。
+- `scheduler` — 虚拟节点、健康探测、指标抓取、**负载感知候选数 / 等待阈值**、
+  `breaker_error_threshold` / `breaker_open_for`（实例级被动熔断）。
+- `connector` — 出站 HTTP transport：per-host 空闲池、`MaxConnsPerHost` 反压、HTTP/2。
+- `server` — `addr`、`read_timeout`、`write_timeout`、`read_header_timeout`（slowloris
+  防护，流式 tail 豁免）、可选 `tls_crt` / `tls_key`。
+- `eventbus` — worker 数 + 缓冲（默认 no-op sink）。
+
 
 ## 测试
 
